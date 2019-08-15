@@ -1,0 +1,1 @@
+def lse(size: Int): String = { val rn = Range(1, size + 1); s"implicit def genTuple$size[${rn.map("T" + _).mkString(",")}](implicit ${rn.map(nr => s"gen$nr: Gen[T$nr]").mkString(", ")}) = Applicative[Gen].map$size(${rn.map(s"gen" + _).mkString(", ")})((${rn.map(_ => "_").mkString(", ")}))"}
