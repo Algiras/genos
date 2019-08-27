@@ -7,74 +7,73 @@ import cats.implicits._
 import cats.{Applicative, MonadError}
 import shapeless.{::, Generic, HList, HNil}
 
-import scala.util.Random
-
 object Generator {
 
   case class GeneratorConfig(maxStringSize: Int, maxListSize: Int, maxSetSize: Int, maxGenTry: Int, debug: Boolean = false)
 
-  type Gen[A] = RWST[IO, GeneratorConfig, List[String], Long, A]
+  type Gen[A] = RWST[IO, GeneratorConfig, List[String], Seed, A]
 
-  def rwst[A] = RWST[IO, GeneratorConfig, List[String], Long, A] _
+  def rwst[A] = RWST[IO, GeneratorConfig, List[String], Seed, A] _
 
-  implicit val genLong: Gen[Long] = RWST((_, value: Long) => {
-    val randValue = new Random(value).nextLong
-    IO.pure((List(s"Seed $randValue, value $randValue"), randValue, randValue))
+  implicit val genLong: Gen[Long] = RWST((_, seed: Seed) => {
+    IO.pure((List(s"Seed ${seed.next}, value ${seed.long}"), seed.next, seed.long))
   })
 
-  private def genBuild[T](randomGen: Random => T): Gen[T] = RWST((_, value: Long) => {
-    val randValue = new Random(value)
-    val seed = randValue.nextLong
-    val randGenValue = randomGen(randValue)
-    IO.pure((List(s"Seed: $seed, value $randGenValue"), seed, randGenValue))
+  private def genBuild[T](randomGen: Seed => T): Gen[T] = RWST((_, value: Seed) => {
+    val nextSeed = value.next
+    val randGenValue = randomGen(value.next)
+    IO.pure((List(s"Seed: $nextSeed, value $randGenValue"), nextSeed, randGenValue))
   })
 
-  implicit val genInt: Gen[Int] = genBuild(_.nextInt)
-  implicit val genDouble: Gen[Double] = genBuild(_.nextDouble)
-  implicit val genBoolean: Gen[Boolean] = genBuild(_.nextBoolean)
-  implicit val genChar: Gen[Char] = genBuild(_.nextPrintableChar)
+  def choose(low: Long, high: Long): Gen[Long] = for {
+    state <- get[IO, GeneratorConfig, List[String], Seed]
+    _ <- tell[IO, GeneratorConfig, List[String], Seed](List(s"Seed for choice: ${state.long}"))
+    v <- genBuild(seed => low + Math.abs(seed.long) % (high - low))
+  } yield v
+
+  implicit val genInt: Gen[Int] = genBuild(seed => seed.long.toInt)
+  implicit val genDouble: Gen[Double] = genBuild(_.long.toDouble)
+  implicit val genBoolean: Gen[Boolean] = genBuild(_.long > 0L)
+  implicit val genChar: Gen[Char] = choose(low = 33, high = 127).map(_.toChar)
 
   implicit val genString: Gen[String] = for {
-    config <- ask[IO, GeneratorConfig, List[String], Long]
-    state <- get[IO, GeneratorConfig, List[String], Long]
-    random = new Random(state)
-    rest <- Range(0, random.nextInt(config.maxStringSize + 1) - 1).map(_ => genChar).toList.sequence
-    _ <- tell[IO, GeneratorConfig, List[String], Long](List(s"Seed: $state, value in String: ${rest.mkString("")}"))
+    config <- ask[IO, GeneratorConfig, List[String], Seed]
+    size <- choose(0, config.maxStringSize)
+    rest <- Range(0, size.toInt).map(_ => genChar).toList.sequence
+    _ <- tell[IO, GeneratorConfig, List[String], Seed](List(s"Random String: ${rest.mkString("")}"))
   } yield rest.mkString("")
 
   def genConst[T](value: T): Gen[T] = RWST((_, s) => IO.pure((List(s"Const value: $value"), s, value)))
 
-  def genOneOf[T](head: Gen[T], rest: Gen[T]*): Gen[T] = for {
-    state <- get[IO, GeneratorConfig, List[String], Long]
-    randValue = new Random(state)
-    values = head +: rest
-    nextV <- values(randValue.nextInt(rest.size + 1))
-    _ <- tell[IO, GeneratorConfig, List[String], Long](List(s"Seed: $state, value: $nextV"))
-  } yield nextV
+  def genOneOf[T](head: Gen[T], rest: Gen[T]*): Gen[T] = {
+    val values = head +: rest
+    for {
+      choice <- choose(0, rest.size)
+      nextV <- values(choice.toInt)
+      _ <- tell[IO, GeneratorConfig, List[String], Seed](List(s"value: $nextV"))
+    } yield nextV
+  }
 
   implicit def genList[T](implicit genT: Gen[T]): Gen[List[T]] = for {
-    config <- ask[IO, GeneratorConfig, List[String], Long]
-    state <- get[IO, GeneratorConfig, List[String], Long]
-    random = new Random(state)
-    list <- Range(0, random.nextInt(config.maxListSize + 1) - 1).map(_ => genT).toList.sequence
-    _ <- tell[IO, GeneratorConfig, List[String], Long](List(s"Seed: $state, value in List: ${list.mkString(", ")}"))
+    config <- ask[IO, GeneratorConfig, List[String], Seed]
+    size <- choose(0, config.maxStringSize)
+    list <- Range(0, size.toInt).map(_ => genT).toList.sequence
+    _ <- tell[IO, GeneratorConfig, List[String], Seed](List(s"Values in List: ${list.mkString(", ")}"))
   } yield list
 
   implicit def genSet[T](implicit genT: Gen[T]): Gen[Set[T]] = {
 
-    // not great something infinite.. :(
-    def recAdd(rest: Set[T], size: Int, counter: Int): Gen[Set[T]] = if(size == 0) genConst(rest) else for {
+    def recAdd(rest: Set[T], size: Int, counter: Int): Gen[Set[T]] = if (size == 0) genConst(rest) else for {
       h <- genT
-      _ <- if(counter > 0) Applicative[Gen].pure(()) else MonadError[Gen, Throwable].raiseError(new RuntimeException("Failed to produce not repeating set"))
-      t <- if(rest.contains(h)) recAdd(rest, size, counter) else recAdd(rest, size - 1, counter - 1)
+      _ <- if (counter > 0) Applicative[Gen].pure(()) else MonadError[Gen, Throwable].raiseError(new RuntimeException("Failed to produce not repeating set"))
+      t <- if (rest.contains(h)) recAdd(rest, size, counter) else recAdd(rest, size - 1, counter - 1)
     } yield t + h
 
     for {
-      config <- ask[IO, GeneratorConfig, List[String], Long]
-      state <- get[IO, GeneratorConfig, List[String], Long]
-      random = new Random(state)
-      set <- recAdd(Set.empty, random.nextInt(config.maxListSize + 1) - 1, config.maxGenTry)
-      _ <- tell[IO, GeneratorConfig, List[String], Long](List(s"Seed: $state, value in Set: ${set.mkString(", ")}"))
+      config <- ask[IO, GeneratorConfig, List[String], Seed]
+      size <- choose(0, config.maxListSize)
+      set <- recAdd(Set.empty, size.toInt, config.maxGenTry)
+      _ <- tell[IO, GeneratorConfig, List[String], Seed](List(s"Value in Set: ${set.mkString(", ")}"))
     } yield set
   }
 
@@ -84,6 +83,7 @@ object Generator {
   } yield head :: rest
 
   implicit val hNilGen: Gen[HNil] = genConst(HNil)
+
   implicit def hListGen[H, T <: HList](implicit hGen: Gen[H], tGen: Gen[T]): Gen[H :: T] = for {
     head <- hGen
     tail <- tGen
@@ -93,7 +93,7 @@ object Generator {
 
   implicit val genTuple0: Gen[Unit] = genConst(())
 
-//  implicit def genTuple1[T1](implicit gen1: Gen[T1]): Gen[T1] = gen1
+  //  implicit def genTuple1[T1](implicit gen1: Gen[T1]): Gen[T1] = gen1
 
   implicit def genTuple2[T1, T2](implicit gen1: Gen[T1], gen2: Gen[T2]): Gen[(T1, T2)] = Applicative[Gen].map2(gen1, gen2)((_, _))
 
